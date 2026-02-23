@@ -1,0 +1,51 @@
+# Object file
+*.o
+
+# Ada Library Information
+*.ali
+
+# entorno virtual
+env/
+.idea
+.vscode
+.env
+*.pyc
+__pycache__/
+dist/
+build/
+*.spec
+driver/
+descargas/
+build/
+dist/
+dist_antes/
+dist_oficial_1.0.1/
+mi_aplicacion_streamlit.egg-info/
+cufes.txt
+serial.txt
+cufes copy.txt
+pruebas.txt
+200_cufes.txt
+dist_manual/
+pruebas_cufes.txt
+
+# archivos locales
+*.xlsx
+*.csv
+*.json
+*.xml
+*.html
+*.pdf
+*.htm
+*.out
+*.err
+*.pid
+*.spec
+
+nit.txt
+
+!server.log
+
+server.log
+
+debug_logs/
