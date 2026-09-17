@@ -32,51 +32,185 @@ El proyecto implementa una API RESTful que actúa como motor central del RPA, or
 2. **Procesamiento por Lotes:** Capacidad para cargar archivos `.xlsx` con miles de registros y procesarlos de forma paralela.
 3. **Exportación de Resultados:** Generación automática de matrices de control fiscal en Excel con el estado real y eventos (ej. RADIAN) de cada documento verificado.
 
-## 🛠️ Instalación y Despliegue
+## Puesta en funcionamiento
 
-### Requisitos Previos
+### Requisitos
 
-- Python 3.8 o superior.
-- Clave API válida del servicio `2Captcha`.
+- Python 3 con `venv` disponible.
+- Google Chrome instalado. La API usa un Chrome normal y aislado para conservar
+  la sesión validada por Cloudflare; no usa el perfil personal del navegador.
+- Una cuenta de 2Captcha y una clave API con saldo, para los casos en que DIAN
+  solicite resolver el widget Turnstile.
+- Acceso a `https://catalogo-vpfe.dian.gov.co` desde el equipo que ejecuta la
+  aplicación.
 
-### Configuración del Entorno
+> El uso del portal DIAN y de 2Captcha debe estar autorizado y respetar los
+> términos de ambos servicios. La clave de 2Captcha puede generar cargos: no la
+> publiques, no la subas a Git ni la incluyas en logs.
 
-1. Clona este repositorio:
-   ```bash
-   git clone https://github.com/tu-usuario/CAFRE.git
-   cd CAFRE
-   ```
+### 1. Preparar el proyecto
 
-2. Crea un archivo `.env` en el directorio raíz con la siguiente configuración:
-   ```env
-   # Clave de API para el servicio de resolución de captchas
-   API_KEY_2CAPTCHA="TU_API_KEY_AQUI"
-
-   # Número de hilos/consultas paralelas (ajustar según CPU y límites de la DIAN)
-   MAX_WORKERS=6
-   ```
-
-3. Instala las dependencias del proyecto:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. Instala los binarios de los navegadores para Playwright:
-   ```bash
-   playwright install
-   ```
-
-### Ejecución de la API
-
-Inicia el servidor local ejecutando:
+Desde la raíz del repositorio:
 
 ```bash
-python run_app.py
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
 ```
 
-El servidor del RPA se iniciará localmente. Puedes acceder a la interfaz gráfica de la API y su documentación interactiva (Swagger UI) navegando a:
-`http://localhost:8000/docs`
+Para verificar la instalación:
 
-## 📊 Impacto y Conclusiones
+```bash
+.venv/bin/python -m unittest discover -v
+.venv/bin/python -m pip check
+```
 
-La implementación de este RPA (CARFE) demuestra la viabilidad técnica de reemplazar procesos operativos manuales en contabilidad mediante herramientas programáticas avanzadas. Los resultados confirman que la automatización no solo elimina el riesgo de digitación y fallos de validación humana frente a obligaciones fiscales, sino que permite al contador público redirigir su esfuerzo cognitivo hacia el análisis financiero, el planeamiento tributario y la toma de decisiones gerenciales de alto valor.
+Playwright se conecta al Chrome ya instalado mediante CDP; por ello no es
+necesario descargar un navegador de Playwright para la operación habitual.
+
+### 2. Configurar las variables de entorno
+
+Copia el ejemplo y edita solamente los valores necesarios:
+
+```bash
+cp .env.example .env
+```
+
+Contenido de referencia de `.env`:
+
+```env
+# Obligatoria cuando la página no tenga un token Turnstile válido.
+API_KEY_2CAPTCHA="REEMPLAZAR_POR_TU_CLAVE"
+
+# Consultas DIAN simultáneas. Mantener 1 reduce bloqueos de Cloudflare/DIAN.
+MAX_WORKERS=1
+
+# Cantidad total de intentos por CUFE, incluido el primer intento.
+DIAN_MAX_ATTEMPTS=3
+
+# Espera inicial entre intentos en segundos. Se duplica en cada reintento:
+# con 3 intentos y valor 2, las esperas son 2 s y 4 s.
+DIAN_RETRY_BASE_DELAY_SECONDS=2
+
+# Perfil exclusivo de CARFE; no apuntar al perfil personal de Chrome.
+CARFE_BROWSER_PROFILE_DIR=.carfe-browser-profile
+
+# CDP queda limitado al equipo local. No exponer este puerto en la red.
+CARFE_CHROME_CDP_PORT=9223
+CARFE_CHROME_CDP_URL=http://127.0.0.1:9223
+
+# Ruta de Chrome en Linux. Ajustar únicamente si Chrome está instalado en otra ruta.
+CARFE_CHROME_EXECUTABLE=/opt/google/chrome/chrome
+```
+
+Variables y comportamiento:
+
+| Variable | Requerida | Función |
+| --- | --- | --- |
+| `API_KEY_2CAPTCHA` | Sí, si no existe token Turnstile válido | Clave privada usada para crear una tarea de resolución. Los errores definitivos de 2Captcha no se reintentan para evitar cargos duplicados. |
+| `MAX_WORKERS` | Recomendada | Máximo de consultas concurrentes. El valor predeterminado es `3`, pero para DIAN se recomienda empezar con `1`. |
+| `DIAN_MAX_ATTEMPTS` | Recomendada | Máximo total de intentos por CUFE, incluido el primero. El predeterminado es `3`; también cubre un HTTP 403 transitorio. |
+| `DIAN_RETRY_BASE_DELAY_SECONDS` | Recomendada | Pausa inicial para backoff exponencial. El predeterminado es `2`; puede ser `0` sólo para pruebas locales. |
+| `CARFE_BROWSER_PROFILE_DIR` | Recomendada | Directorio del perfil aislado que guarda la sesión de CARFE. El predeterminado es `.carfe-browser-profile`; no usar un perfil personal. |
+| `CARFE_CHROME_CDP_PORT` y `CARFE_CHROME_CDP_URL` | Recomendada | Puerto y URL local mediante los que la API se conecta al Chrome aislado. Los predeterminados usan `9223` y deben coincidir si se modifican. |
+| `CARFE_CHROME_EXECUTABLE` | Recomendada | Ejecutable de Google Chrome usado para abrir el perfil aislado. El predeterminado corresponde a la instalación habitual de Linux. |
+
+Si se cambia alguna variable, detén e inicia de nuevo la API. Si cambias el
+puerto CDP, cierra el Chrome CARFE anterior antes de volver a inicializarlo.
+
+### 3. Inicializar Chrome para DIAN
+
+En una primera terminal, con el entorno configurado, ejecuta:
+
+```bash
+.venv/bin/python -m paquetes.inicializar_perfil_dian
+```
+
+Se abrirá un Chrome independiente en la página de consulta DIAN. Completa
+manualmente cualquier verificación de Cloudflare que aparezca y, cuando veas el
+formulario de búsqueda, vuelve a la terminal y presiona `Enter`.
+
+Mantén esa ventana de Chrome abierta mientras uses la API. El proceso no copia
+cookies del navegador personal ni cierra el Chrome CARFE al finalizar una
+consulta. Si la API indica que Chrome no está abierto, repite este paso.
+
+### 4. Iniciar la API
+
+En una segunda terminal, desde la raíz del proyecto:
+
+```bash
+.venv/bin/python run_app.py
+```
+
+La documentación interactiva estará en [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
+El script actual escucha en el puerto 8000; no lo publiques directamente a
+Internet ni expongas el puerto CDP 9223. Para un entorno de red se requiere una
+capa de autenticación, TLS y restricción de acceso antes de exponer la API.
+
+### 5. Formato del archivo de entrada
+
+El endpoint de carga acepta únicamente archivos `.xlsx`. Lee la primera hoja y
+requiere exactamente estas columnas:
+
+```text
+CUFE/CUDE
+NIT Emisor
+Tipo de documento
+Forma de Pago
+Grupo
+```
+
+Solo se enviarán a DIAN las filas con estas condiciones:
+
+- `Tipo de documento`: `Factura electrónica` o `Factura electrónica de contingencia`.
+- `Forma de Pago`: `2` o `3`.
+- `Grupo`: `Recibido`.
+- `CUFE/CUDE` no vacío y `NIT Emisor` compuesto únicamente por dígitos. El NIT se
+  consulta sin puntos, comas ni dígito de verificación.
+
+No se admiten todavía archivos `.xls`, `.csv`, `.ods`, ni una hoja que solo
+contenga CUFE y NIT.
+
+### 6. Flujo de consulta mediante Swagger
+
+1. Abre `http://127.0.0.1:8000/docs`.
+2. En `POST /ingreso-archivo-cufes/`, selecciona el `.xlsx` y pulsa **Execute**.
+3. Copia el `session_id` de la respuesta. Es temporal y vence tras una hora.
+4. En `POST /consulta-masiva-cufes/`, pulsa **Try it out**, ingresa el valor en
+   el encabezado `session-id` y ejecuta la solicitud.
+5. Descarga `resultado_consultas_cufes.xlsx` de la respuesta.
+
+El resultado incluye el CUFE, tipo y datos del documento, eventos y el enlace
+de consulta. Si un CUFE termina como `error_procesamiento`, la columna
+`Eventos` conserva el mensaje técnico para su revisión.
+
+También puedes consultar una factura individual con:
+
+```text
+GET /cufe-individual/{cufe}?nit={nit_emisor}
+```
+
+Ejemplo de llamada local:
+
+```bash
+curl "http://127.0.0.1:8000/cufe-individual/CUFE_AQUI?nit=900123456"
+```
+
+### Diagnóstico sin consultas ni captcha
+
+Para comprobar que el Chrome aislado sigue accesible y que la página carga, sin
+enviar CUFEs ni crear tareas de captcha:
+
+```bash
+.venv/bin/python -m paquetes.diagnostico_dian
+```
+
+## Problemas frecuentes
+
+| Situación | Acción recomendada |
+| --- | --- |
+| `Chrome CARFE no está abierto` | Ejecuta `python -m paquetes.inicializar_perfil_dian`, completa Cloudflare y deja Chrome abierto. |
+| HTTP 403 en una consulta | Se reintenta según `DIAN_MAX_ATTEMPTS`. Si persiste, vuelve a validar Cloudflare y reduce `MAX_WORKERS` a `1`. |
+| Error de 2Captcha | Revisa saldo, clave y el mensaje devuelto. No se reintenta automáticamente un error definitivo del proveedor. |
+| Archivo rechazado | Confirma extensión `.xlsx`, primera hoja y nombres exactos de las cinco columnas requeridas. |
+| No hay documentos para procesar | Revisa los cuatro filtros definidos en la sección de formato de entrada. |

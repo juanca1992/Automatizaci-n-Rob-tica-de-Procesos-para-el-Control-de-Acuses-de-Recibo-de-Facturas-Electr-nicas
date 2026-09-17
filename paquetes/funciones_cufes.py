@@ -3,17 +3,67 @@ import asyncio
 import time
 import re
 import random
+from contextlib import asynccontextmanager
 from bs4 import BeautifulSoup
 import pandas as pd
 import html
 from tqdm import tqdm
-from .excepciones import ScrapingError, CufeNotFoundError, FileProcessingError
-from twocaptcha import TwoCaptcha
+from .excepciones import DianAccessError, ScrapingError, CufeNotFoundError, FileProcessingError
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from dotenv import load_dotenv
 import logging
+from .captcha_2captcha import CaptchaResolutionError, resolver_turnstile_proxyless
+from .navegador_dian import abrir_contexto_dian
+
+load_dotenv()
 
 # Obtener un logger para este módulo
 logger = logging.getLogger(__name__)
+
+# Captura parámetros declarados en turnstile.render sin impedir que el widget se
+# dibuje. Cloudflare Challenge requiere cData/chlPageData y no se resuelve a
+# ciegas con una tarea proxyless.
+TURNSTILE_CAPTURE_SCRIPT = """
+(() => {
+  window.__carfeTurnstile = { params: null, callback: null };
+  const attach = () => {
+    if (!window.turnstile || window.turnstile.__carfeWrapped) return;
+    const originalRender = window.turnstile.render.bind(window.turnstile);
+    const wrappedRender = (container, options = {}) => {
+      window.__carfeTurnstile.params = {
+        sitekey: options.sitekey || null,
+        action: options.action || null,
+        cData: options.cData || null,
+        chlPageData: options.chlPageData || null,
+      };
+      window.__carfeTurnstile.callback = typeof options.callback === 'function' ? options.callback : null;
+      return originalRender(container, options);
+    };
+    wrappedRender.__carfeWrapped = true;
+    window.turnstile.render = wrappedRender;
+  };
+  setInterval(attach, 10);
+})();
+"""
+
+
+@asynccontextmanager
+async def navegador_dian():
+    """Abre el perfil persistente y aislado de CARFE para el portal DIAN."""
+    playwright = await async_playwright().start()
+    browser = None
+    try:
+        browser = await abrir_contexto_dian(playwright)
+        yield browser
+    finally:
+        # browser.close() cerraría el Chrome CARFE del usuario; se libera sólo
+        # la conexión CDP y el navegador permanece disponible para la API.
+        await playwright.stop()
+
+
+async def nueva_pagina(browser):
+    """Crea una página en el contexto persistente de CARFE."""
+    return await browser.contexts[0].new_page()
 
 # --------------------------------------------------------------------------------
 # Decorador para reintentos con backoff exponencial (versión async)
@@ -25,26 +75,60 @@ def backoff_delay(attempt, base_delay=2):
     """
     return base_delay * (2 ** attempt)
 
-def retry(max_retries=5, base_delay=2):
+
+def _positive_int_from_env(name, default):
+    """Obtiene un entero positivo de entorno sin dejar la API inutilizable."""
+    try:
+        value = int(os.getenv(name, default))
+        return value if value >= 1 else default
+    except (TypeError, ValueError):
+        logger.warning("%s debe ser un entero positivo; se usará %s.", name, default)
+        return default
+
+
+def _non_negative_float_from_env(name, default):
+    """Obtiene un número no negativo de entorno para las pausas de reintento."""
+    try:
+        value = float(os.getenv(name, default))
+        return value if value >= 0 else default
+    except (TypeError, ValueError):
+        logger.warning("%s debe ser un número no negativo; se usará %s.", name, default)
+        return default
+
+
+def retry(max_attempts=None, base_delay=None):
     """
     Decorador para reintentar la ejecución de una función asíncrona ante excepciones,
-    usando backoff exponencial en cada reintento.
+    usando backoff exponencial en cada reintento. Cuando no se indican valores
+    explícitos, se configura con DIAN_MAX_ATTEMPTS (incluye el primer intento) y
+    DIAN_RETRY_BASE_DELAY_SECONDS.
     """
     def decorator(func):
         async def wrapper(*args, **kwargs):
+            attempts = max_attempts or _positive_int_from_env("DIAN_MAX_ATTEMPTS", 3)
+            delay_base = (
+                base_delay
+                if base_delay is not None
+                else _non_negative_float_from_env("DIAN_RETRY_BASE_DELAY_SECONDS", 2)
+            )
             ex = None
-            for attempt in range(max_retries):
+            for attempt in range(attempts):
                 try:
                     return await func(*args, **kwargs)
                 except Exception as e:
                     ex = e
-                    if attempt < max_retries - 1:
-                        delay = backoff_delay(attempt, base_delay)
-                        logger.warning(f"Error en {func.__name__}: {e}. Reintentando en {delay} seg (intento {attempt + 1}/{max_retries})...")
+                    if not getattr(e, "retryable", True):
+                        raise
+                    if attempt < attempts - 1:
+                        delay = backoff_delay(attempt, delay_base)
+                        logger.warning(
+                            "Error en %s: %s. Reintentando en %s seg (nuevo intento %s/%s)...",
+                            func.__name__, e, delay, attempt + 2, attempts,
+                        )
                         await asyncio.sleep(delay)
                     else:
                         logger.error(f"Máximo de reintentos alcanzado para {func.__name__}. Último error: {e}")
-            raise ScrapingError(f"Falló la operación {func.__name__} después de {max_retries} intentos. Último error: {ex}")
+            raise ScrapingError(f"Falló la operación {func.__name__} después de {attempts} intentos. Último error: {ex}")
         return wrapper
     return decorator
 
@@ -52,45 +136,75 @@ def retry(max_retries=5, base_delay=2):
 # Funciones para solicitudes y scraping de contenido HTML
 # --------------------------------------------------------------------------------
 
-@retry(max_retries=5, base_delay=2)
-async def obtener_pagina_con_cufe(cufe, browser_instance=None):
+@retry()
+async def obtener_pagina_con_cufe(cufe, nit, browser_instance=None):
     """
     Resuelve un captcha Turnstile, ingresa un CUFE y obtiene el HTML resultante usando Playwright.
     Si se proporciona `browser_instance`, la utiliza; de lo contrario, crea una nueva.
     """
-    if not cufe:
-        raise ValueError("El CUFE no puede estar vacío.")
-
-    solver = TwoCaptcha(os.getenv("API_KEY_2CAPTCHA", ""), defaultTimeout=180)
+    if not cufe or not nit:
+        raise ValueError("CUFE y NIT son obligatorios.")
 
     async def _perform_scraping(browser):
-        page = await browser.new_page()
+        page = await nueva_pagina(browser)
         try:
-            await page.goto('https://catalogo-vpfe.dian.gov.co/User/SearchDocument', timeout=60000)
+            await page.add_init_script(TURNSTILE_CAPTURE_SCRIPT)
+            response = await page.goto('https://catalogo-vpfe.dian.gov.co/User/SearchDocument', timeout=60000)
+            if response and response.status >= 400:
+                raise DianAccessError(response.status)
             
             # Espera a que la página principal y sus recursos terminen de cargar.
             await page.wait_for_load_state('load', timeout=30000)
 
             await page.wait_for_selector('.cf-turnstile', timeout=30000)
             
-            resultado = solver.turnstile(
-                sitekey='0x4AAAAAAAg1WuNb-OnOa76z',
-                url='https://catalogo-vpfe.dian.gov.co/User/SearchDocument'
+            widget = page.locator('.cf-turnstile').first
+            captured = await page.evaluate(
+                "() => (window.__carfeTurnstile && window.__carfeTurnstile.params) || {}"
             )
-            token = resultado['code']
+            sitekey = captured.get('sitekey') or await widget.get_attribute('data-sitekey')
+            if not sitekey:
+                raise CaptchaResolutionError("No fue posible obtener el sitekey de Turnstile en DIAN.")
 
-            await page.evaluate(f'document.querySelector("[name=\'cf-turnstile-response\']").value="{token}";')
+            action = captured.get('action') or await widget.get_attribute('data-action')
+            cdata = captured.get('cData') or await widget.get_attribute('data-cdata')
+            pagedata = captured.get('chlPageData')
+            if cdata or pagedata:
+                raise CaptchaResolutionError(
+                    "DIAN presentó un Cloudflare Challenge. Requiere una configuración explícita "
+                    "de proxy, user-agent y callback antes de crear una tarea pagada."
+                )
+
+            token_field = page.locator("[name='cf-turnstile-response']")
+            token_existente = await token_field.evaluate("(element) => Boolean(element.value)")
+            if not token_existente:
+                token = (await resolver_turnstile_proxyless(
+                    website_url=page.url,
+                    website_key=sitekey,
+                    action=action,
+                )).token
+                await token_field.evaluate(
+                    "(element, token) => { element.value = token; element.dispatchEvent(new Event('input', {bubbles: true})); element.dispatchEvent(new Event('change', {bubbles: true})); }",
+                    token,
+                )
+                await page.evaluate(
+                    """(token) => {
+                        const state = window.__carfeTurnstile;
+                        if (state && typeof state.callback === 'function') state.callback(token);
+                    }""",
+                    token,
+                )
             await page.fill('#DocumentKey', cufe)
-            
-            # Pequeña pausa antes de hacer clic para asegurar que el JS de la página se haya estabilizado.
-            await asyncio.sleep(1)
+            await page.locator('#DocumentKey').press('Tab')
+            await page.wait_for_selector('#SearchDocumentNit', state='visible', timeout=15000)
+            await page.fill('#SearchDocumentNit', nit)
 
             # Hacemos clic y le damos 60 segundos para que la navegación se complete.
             await page.click("xpath=//button[contains(text(),'Buscar')]", timeout=60000)
 
-            # Esperar a que aparezca el contenedor de resultados o un mensaje de error de captcha
+            # Esperar una señal específica del documento, no el contenedor inicial del formulario.
             await page.wait_for_selector(
-                'div.container-md, span.field-validation-error', 
+                'span.tipo-doc, span.field-validation-error',
                 timeout=60000
             )
 
@@ -133,12 +247,8 @@ async def obtener_pagina_con_cufe(cufe, browser_instance=None):
     if browser_instance:
         return await _perform_scraping(browser_instance)
     else:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            try:
-                return await _perform_scraping(browser)
-            finally:
-                await browser.close()
+        async with navegador_dian() as browser:
+            return await _perform_scraping(browser)
 
 
 def consultar_html(contenido_html, cufe):
@@ -215,17 +325,17 @@ def consultar_html(contenido_html, cufe):
     }
     return data
 
-async def consulta_individual(cufe):
+async def consulta_individual(cufe, nit):
     """
     Consulta un CUFE individualmente.
     """
     # Llama a la función refactorizada sin pasar una instancia de browser.
     # La función se encargará de crear y destruir la instancia por sí misma.
-    contenido_html = await obtener_pagina_con_cufe(cufe)
+    contenido_html = await obtener_pagina_con_cufe(cufe, nit)
     resultado = consultar_html(contenido_html, cufe)
     return resultado
 
-async def consulta_cufe_paralelo(cufes, max_trabajadores: int = None):
+async def consulta_cufe_paralelo(consultas, max_trabajadores: int = None):
     """
     Consulta múltiples CUFEs en paralelo de forma eficiente, reutilizando una
     única instancia de navegador y limitando la concurrencia.
@@ -237,13 +347,15 @@ async def consulta_cufe_paralelo(cufes, max_trabajadores: int = None):
     resultados = []
     sem = asyncio.Semaphore(max_trabajadores)
 
-    async def _consultar_y_procesar(browser, cufe):
+    async def _consultar_y_procesar(browser, consulta):
+        cufe = consulta['cufe']
+        nit = consulta['nit']
         # Pausa aleatoria para "humanizar" el tráfico y evitar bloqueos
         await asyncio.sleep(random.uniform(0.5, 3.0))
         async with sem:
             try:
                 # Pasamos la instancia compartida del navegador
-                contenido_html = await obtener_pagina_con_cufe(cufe, browser_instance=browser)
+                contenido_html = await obtener_pagina_con_cufe(cufe, nit, browser_instance=browser)
                 return consultar_html(contenido_html, cufe)
             except CufeNotFoundError:
                 return {"Cufe": cufe, "Tipo de Documento": "cufe_no_encontrado"}
@@ -251,15 +363,11 @@ async def consulta_cufe_paralelo(cufes, max_trabajadores: int = None):
                 logger.error(f"Error procesando el CUFE {cufe}: {e}")
                 return {"Cufe": cufe, "Tipo de Documento": "error_procesamiento", "Eventos": str(e)}
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        try:
-            tasks = [_consultar_y_procesar(browser, cufe) for cufe in cufes]
-            for future in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Consultando CUFEs"):
-                resultado = await future
-                resultados.append(resultado)
-        finally:
-            await browser.close()
+    async with navegador_dian() as browser:
+        tasks = [_consultar_y_procesar(browser, consulta) for consulta in consultas]
+        for future in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Consultando CUFEs"):
+            resultado = await future
+            resultados.append(resultado)
             
     return resultados
 

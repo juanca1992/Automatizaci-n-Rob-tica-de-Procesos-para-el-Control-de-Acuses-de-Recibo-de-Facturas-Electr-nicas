@@ -1,20 +1,20 @@
 import pandas as pd
 import io
-from typing import List, Tuple
+from typing import List
 import paquetes.funciones_cufes as fc
 
-async def procesar_y_generar_excel_cufes(lista_cufes: List[str]) -> io.BytesIO:
+async def procesar_y_generar_excel_cufes(consultas: List[dict[str, str]]) -> io.BytesIO:
     """
     Orquesta la consulta masiva de CUFEs y genera un archivo Excel en memoria.
 
     Args:
-        lista_cufes: Una lista de strings, donde cada string es un CUFE a consultar.
+        consultas: Lista de CUFEs y NITs requeridos por la búsqueda DIAN.
 
     Returns:
         Un objeto BytesIO con el contenido del archivo Excel.
     """
     # 1. Realizar la consulta masiva en paralelo para obtener los datos
-    data = await fc.consulta_cufe_paralelo(lista_cufes)
+    data = await fc.consulta_cufe_paralelo(consultas)
 
     # 2. Crear un DataFrame de pandas con los resultados
     df = pd.DataFrame(data)

@@ -6,6 +6,8 @@
 
 # entorno virtual
 env/
+.venv/
+.carfe-browser-profile/
 .idea
 .vscode
 .env

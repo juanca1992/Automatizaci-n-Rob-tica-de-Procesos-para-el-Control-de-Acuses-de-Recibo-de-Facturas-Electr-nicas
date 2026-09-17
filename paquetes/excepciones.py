@@ -20,6 +20,16 @@ class DianServiceError(ScrapingError):
     def __init__(self, message="El servicio de la DIAN no está disponible o no responde."):
         super().__init__(message)
 
+class DianAccessError(ScrapingError):
+    """La red o DIAN bloqueó el acceso antes de cargar la página de búsqueda."""
+
+    # Un 403 de Cloudflare/DIAN puede ser transitorio mientras la sesión de
+    # Chrome se estabiliza; el número de intentos se controla desde .env.
+    retryable = True
+
+    def __init__(self, status_code: int):
+        super().__init__(f"DIAN rechazó el acceso a la búsqueda (HTTP {status_code}).")
+
 class CufeNotFoundError(ScrapingError):
     """Lanzada cuando un CUFE específico no se encuentra en el sistema de la DIAN."""
     def __init__(self, cufe: str):

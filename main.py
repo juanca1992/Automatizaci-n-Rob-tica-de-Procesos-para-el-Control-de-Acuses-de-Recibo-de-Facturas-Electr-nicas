@@ -6,7 +6,7 @@ import uuid
 import paquetes.funciones_cufes as fc
 import paquetes.servicio_cufe as sc
 import os
-from paquetes.lector_reportes import leer_cufes_desde_excel
+from paquetes.lector_reportes import leer_consultas_desde_excel
 from paquetes.excepciones import ScrapingError, CufeNotFoundError, ReporteError
 from dotenv import load_dotenv
 
@@ -27,13 +27,13 @@ async def ingreso_archivo_cufes(archivo: UploadFile = File(...)):
             temp_file_path = temp_file.name
             temp_file.write(await archivo.read())
 
-        lista_cufes = leer_cufes_desde_excel(temp_file_path)
+        consultas = leer_consultas_desde_excel(temp_file_path)
         session_id = str(uuid.uuid4())
-        session_cache[session_id] = {"lista_cufes": lista_cufes}
+        session_cache[session_id] = {"consultas": consultas}
 
         return JSONResponse(
             content={
-                "message": f"Archivo procesado con éxito. Se encontraron {len(lista_cufes)} CUFEs para consultar.",
+                "message": f"Archivo procesado con éxito. Se encontraron {len(consultas)} CUFEs para consultar.",
                 "session_id": session_id
             },
             status_code=200
@@ -53,12 +53,12 @@ async def consultar_cufes_masivo(session_id: str = Header(...)):
     if not session_data:
         raise HTTPException(status_code=400, detail="Session ID inválido o expirado.")
 
-    lista_cufes = session_data.get("lista_cufes")
-    if not lista_cufes:
+    consultas = session_data.get("consultas")
+    if not consultas:
         return JSONResponse(content={"message": "No hay CUFES para consultar."}, status_code=400)
     
     try:
-        excel_buffer = await sc.procesar_y_generar_excel_cufes(lista_cufes)
+        excel_buffer = await sc.procesar_y_generar_excel_cufes(consultas)
         return Response(
             content=excel_buffer.getvalue(),
             media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -70,9 +70,9 @@ async def consultar_cufes_masivo(session_id: str = Header(...)):
         raise HTTPException(status_code=500, detail="Ocurrió un error interno durante la consulta masiva.")
 
 @app.get("/cufe-individual/{cufe}", tags=["CUFE"])
-async def consulta_individual_cufe(cufe: str):
+async def consulta_individual_cufe(cufe: str, nit: str):
     try:
-        data = await fc.consulta_individual(cufe)
+        data = await fc.consulta_individual(cufe, nit)
         return JSONResponse(content=data, status_code=200)
     except CufeNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
